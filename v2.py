@@ -257,25 +257,50 @@ class Tensor:
             return Tensor([float(other)], shape=(), requires_grad=False)
         raise TypeError(f"Cannot coerce {type(other).__name__} to Tensor")
     
+    @staticmethod
+    def _broadcast_shape(a_shape, b_shape):
+        out = []
+        na, nb = len(a_shape), len(b_shape)
+
+        for i in range(1, max(na, nb) + 1):
+            da = a_shape[-i] if i <= na else 1
+            db = b_shape[-i] if i <= nb else 1
+
+            if da != db and da != 1 and db != 1:
+                raise ValueError(f"Cannot broadcast shapes {a_shape} and {b_shape}")
+
+            out.append(max(da, db))
+
+        return tuple(reversed(out))
+
+    @staticmethod
+    def _broadcast_index(out_idx, in_shape):
+        pad = len(out_idx) - len(in_shape)
+        idx = []
+
+        for i, dim in enumerate(in_shape):
+            oi = out_idx[pad + i]
+            idx.append(0 if dim == 1 else oi)
+
+        return tuple(idx)
+    
     def __add__(self, other):
         other = self._coerce(other)
-        if self.shape == ():
-            s = self.storage[self.offset]
-            out = Tensor.zeros(other.shape, requires_grad=self.requires_grad or other.requires_grad)
-            for idx in self._iter_indices(other.shape):
-                out.storage[out._storage_index(idx)] = s + other.get(*idx)
-            return out
-        if other.shape == ():
-            s = other.storage[other.offset]
-            out = Tensor.zeros(self.shape, requires_grad=self.requires_grad or other.requires_grad)
-            for idx in self._iter_indices(self.shape):
-                out.storage[out._storage_index(idx)] = self.get(*idx) + s
-            return out
-        if self.shape != other.shape:
-            raise ValueError("Shapes must match for addition")
-        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad or other.requires_grad)
-        for idx in self._iter_indices(self.shape):
-            out.storage[out._storage_index(idx)] = self.get(*idx) + other.get(*idx)
+        out_shape = self._broadcast_shape(self.shape, other.shape)
+
+        out = Tensor.zeros(
+            out_shape,
+            requires_grad=self.requires_grad or other.requires_grad,
+        )
+
+        for out_idx in self._iter_indices(out_shape):
+            a_idx = self._broadcast_index(out_idx, self.shape)
+            b_idx = self._broadcast_index(out_idx, other.shape)
+
+            out.storage[out._storage_index(out_idx)] = (
+                self.get(*a_idx) + other.get(*b_idx)
+            )
+
         return out
     
     __radd__ = __add__
@@ -375,6 +400,34 @@ def test_add_two_views():
     xt = x.transpose(0, 1)
     assert (xt + xt).tolist() == [[2.0, 8.0], [4.0, 10.0], [6.0, 12.0]]
 
+def test_row_broadcast_add():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    row = Tensor.from_nested([[10, 20, 30]])
+    assert (x + row).tolist() == [
+        [11.0, 22.0, 33.0],
+        [14.0, 25.0, 36.0],
+    ]
+
+def test_col_broadcast_add():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    col = Tensor.from_nested([[10], [20]])
+    assert (x + col).tolist() == [
+        [11.0, 12.0, 13.0],
+        [24.0, 25.0, 26.0],
+    ]
+
+def test_scalar_left_add():
+    x = Tensor.from_nested([[1, 2], [3, 4]])
+    assert (2 + x).tolist() == [[3.0, 4.0], [5.0, 6.0]]
+
+def test_1d_broadcast_add():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    v = Tensor.from_nested([10, 20, 30])
+    assert (x + v).tolist() == [
+        [11.0, 22.0, 33.0],
+        [14.0, 25.0, 36.0],
+    ]
+
 test_views()
 test_aliasing()
 test_3d_views()
@@ -383,4 +436,8 @@ test_negative_dims()
 test_negative_permute()
 test_add_on_view()
 test_add_two_views()
+test_row_broadcast_add()
+test_col_broadcast_add()
+test_scalar_left_add()
+test_1d_broadcast_add()
 print("All tests passed!")
