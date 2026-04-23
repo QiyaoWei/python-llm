@@ -245,6 +245,41 @@ class Tensor:
     def __repr__(self):
         return f"Tensor(shape={self.shape}, strides={self.strides}, offset={self.offset}, requires_grad={self.requires_grad})"
     
+    @classmethod
+    def full(cls, shape, fill_value, requires_grad=False):
+        return cls([float(fill_value)] * cls._prod(shape), shape=shape, requires_grad=requires_grad)
+    
+    @staticmethod
+    def _coerce(other):
+        if isinstance(other, Tensor):
+            return other
+        if isinstance(other, (int, float)):
+            return Tensor([float(other)], shape=(), requires_grad=False)
+        raise TypeError(f"Cannot coerce {type(other).__name__} to Tensor")
+    
+    def __add__(self, other):
+        other = self._coerce(other)
+        if self.shape == ():
+            s = self.storage[self.offset]
+            out = Tensor.zeros(other.shape, requires_grad=self.requires_grad or other.requires_grad)
+            for idx in self._iter_indices(other.shape):
+                out.storage[out._storage_index(idx)] = s + other.get(*idx)
+            return out
+        if other.shape == ():
+            s = other.storage[other.offset]
+            out = Tensor.zeros(self.shape, requires_grad=self.requires_grad or other.requires_grad)
+            for idx in self._iter_indices(self.shape):
+                out.storage[out._storage_index(idx)] = self.get(*idx) + s
+            return out
+        if self.shape != other.shape:
+            raise ValueError("Shapes must match for addition")
+        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad or other.requires_grad)
+        for idx in self._iter_indices(self.shape):
+            out.storage[out._storage_index(idx)] = self.get(*idx) + other.get(*idx)
+        return out
+    
+    __radd__ = __add__
+    
 def test_views():
     x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
 
@@ -270,5 +305,82 @@ def test_views():
     assert yc.is_contiguous()
     assert yc.reshape(6).tolist() == [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
 
+def test_aliasing():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)
+
+    x.storage[1] = 99.0
+    assert xt.get(1, 0) == 99.0
+
+def test_3d_views():
+    x = Tensor.from_nested([
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+    ])  # shape (2, 2, 2)
+
+    assert x.permute(1, 0, 2).tolist() == [
+        [[1.0, 2.0], [5.0, 6.0]],
+        [[3.0, 4.0], [7.0, 8.0]],
+    ]
+    assert x.narrow(1, 0, 1).tolist() == [
+        [[1.0, 2.0]],
+        [[5.0, 6.0]],
+    ]
+    assert x.select(2, 1).tolist() == [
+        [2.0, 4.0],
+        [6.0, 8.0],
+    ]
+
+def test_contiguous_is_copy():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)
+    y = xt.contiguous()
+
+    x.storage[0] = 99.0
+    assert xt.get(0, 0) == 99.0
+    assert y.get(0, 0) == 1.0
+
+def test_negative_dims():
+    x = Tensor.from_nested([
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+    ])
+
+    assert x.transpose(-1, -2).tolist() == [
+        [[1.0, 3.0], [2.0, 4.0]],
+        [[5.0, 7.0], [6.0, 8.0]],
+    ]
+    assert x.select(-1, 1).tolist() == [
+        [2.0, 4.0],
+        [6.0, 8.0],
+    ]
+
+def test_negative_permute():
+    x = Tensor.from_nested([
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+    ])
+    assert x.permute(-1, 0, 1).tolist() == [
+        [[1.0, 3.0], [5.0, 7.0]],
+        [[2.0, 4.0], [6.0, 8.0]],
+    ]
+
+def test_add_on_view():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)
+    assert (xt + 10).tolist() == [[11.0, 14.0], [12.0, 15.0], [13.0, 16.0]]
+
+def test_add_two_views():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)
+    assert (xt + xt).tolist() == [[2.0, 8.0], [4.0, 10.0], [6.0, 12.0]]
+
 test_views()
+test_aliasing()
+test_3d_views()
+test_contiguous_is_copy()
+test_negative_dims()
+test_negative_permute()
+test_add_on_view()
+test_add_two_views()
 print("All tests passed!")
