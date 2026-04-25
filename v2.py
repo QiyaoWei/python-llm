@@ -21,8 +21,8 @@ class Tensor:
             raise ValueError("shape and strides must have the same length")
         if any(d < 0 for d in self.shape):
             raise ValueError("shape dimensions must be non-negative")
-        if any(s <= 0 for s in self.strides):
-            raise ValueError("strides must be positive")
+        if any(s < 0 for s in self.strides):
+            raise ValueError("negative strides not supported yet")
         if self.offset < 0:
             raise ValueError("offset must be non-negative")
         if self.numel():
@@ -266,44 +266,176 @@ class Tensor:
             da = a_shape[-i] if i <= na else 1
             db = b_shape[-i] if i <= nb else 1
 
-            if da != db and da != 1 and db != 1:
+            if da == db:
+                out_dim = da
+            elif da == 1:
+                out_dim = db
+            elif db == 1:
+                out_dim = da
+            else:
                 raise ValueError(f"Cannot broadcast shapes {a_shape} and {b_shape}")
 
-            out.append(max(da, db))
+            out.append(out_dim)
 
         return tuple(reversed(out))
 
-    @staticmethod
-    def _broadcast_index(out_idx, in_shape):
-        pad = len(out_idx) - len(in_shape)
-        idx = []
+    # @staticmethod
+    # def _broadcast_index(out_idx, in_shape):
+    #     pad = len(out_idx) - len(in_shape)
+    #     idx = []
 
-        for i, dim in enumerate(in_shape):
-            oi = out_idx[pad + i]
-            idx.append(0 if dim == 1 else oi)
+    #     for i, dim in enumerate(in_shape):
+    #         oi = out_idx[pad + i]
+    #         idx.append(0 if dim == 1 else oi)
 
-        return tuple(idx)
+    #     return tuple(idx)
     
+    def _expand_to(self, shape):
+        shape = tuple(shape)
+        return self if self.shape == shape else self.expand(shape)
+
     def __add__(self, other):
         other = self._coerce(other)
         out_shape = self._broadcast_shape(self.shape, other.shape)
+
+        a = self._expand_to(out_shape)
+        b = other._expand_to(out_shape)
 
         out = Tensor.zeros(
             out_shape,
             requires_grad=self.requires_grad or other.requires_grad,
         )
 
-        for out_idx in self._iter_indices(out_shape):
-            a_idx = self._broadcast_index(out_idx, self.shape)
-            b_idx = self._broadcast_index(out_idx, other.shape)
+        for idx in self._iter_indices(out_shape):
+            out.storage[out._storage_index(idx)] = a.get(*idx) + b.get(*idx)
 
-            out.storage[out._storage_index(out_idx)] = (
-                self.get(*a_idx) + other.get(*b_idx)
-            )
+        return out
+
+    __radd__ = __add__
+
+    def __mul__(self, other):
+        other = self._coerce(other)
+        out_shape = self._broadcast_shape(self.shape, other.shape)
+
+        a = self._expand_to(out_shape)
+        b = other._expand_to(out_shape)
+
+        out = Tensor.zeros(
+            out_shape,
+            requires_grad=self.requires_grad or other.requires_grad,
+        )
+
+        for idx in self._iter_indices(out_shape):
+            out.storage[out._storage_index(idx)] = a.get(*idx) * b.get(*idx)
+
+        return out
+
+    __rmul__ = __mul__
+
+    @staticmethod
+    def _canon_axes(axis, ndim):
+        if axis is None:
+            return tuple(range(ndim))
+        if isinstance(axis, int):
+            axis = (axis,)
+        axes = tuple(Tensor._canon_dim(a, ndim) for a in axis)
+        if len(set(axes)) != len(axes):
+            raise ValueError("duplicate axes are not allowed")
+        return tuple(sorted(axes))
+    
+    def sum(self, axis=None, keepdims=False):
+        ndim = len(self.shape)
+        axes = self._canon_axes(axis, ndim)
+
+        if keepdims:
+            out_shape = tuple(1 if i in axes else self.shape[i] for i in range(ndim))
+        else:
+            out_shape = tuple(self.shape[i] for i in range(ndim) if i not in axes)
+
+        out = Tensor.zeros(out_shape, requires_grad=self.requires_grad)
+
+        for idx in self._iter_indices(self.shape):
+            if keepdims:
+                out_idx = tuple(0 if i in axes else idx[i] for i in range(ndim))
+            else:
+                out_idx = tuple(idx[i] for i in range(ndim) if i not in axes)
+
+            out.storage[out._storage_index(out_idx)] += self.get(*idx)
 
         return out
     
-    __radd__ = __add__
+    def mean(self, axis=None, keepdims=False):
+        ndim = len(self.shape)
+        axes = self._canon_axes(axis, ndim)
+
+        denom = 1
+        for a in axes:
+            denom *= self.shape[a]
+
+        return self.sum(axis=axes, keepdims=keepdims) * (1.0 / denom)
+    
+    def __matmul__(self, other):
+        if not isinstance(other, Tensor):
+            raise TypeError("@ only supports Tensor @ Tensor")
+        if len(self.shape) != 2 or len(other.shape) != 2:
+            raise ValueError("matmul currently supports only 2D tensors")
+
+        M, K = self.shape
+        K2, N = other.shape
+        if K != K2:
+            raise ValueError(f"Shapes {self.shape} and {other.shape} not compatible for matmul")
+
+        out = Tensor.zeros(
+            (M, N),
+            requires_grad=self.requires_grad or other.requires_grad,
+        )
+
+        for i in range(M):
+            for j in range(N):
+                acc = 0.0
+                for k in range(K):
+                    acc += self.get(i, k) * other.get(k, j)
+                out.storage[out._storage_index((i, j))] = acc
+
+        return out
+    
+    def expand(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        else:
+            shape = tuple(shape)
+
+        if len(shape) < len(self.shape):
+            raise ValueError("cannot expand to fewer dimensions")
+
+        # Right-align the old shape with the new one.
+        pad = len(shape) - len(self.shape)
+        old_shape = (1,) * pad + self.shape
+        old_strides = (0,) * pad + self.strides
+
+        new_strides = []
+        for old_dim, old_stride, new_dim in zip(old_shape, old_strides, shape):
+            if new_dim < 0:
+                raise ValueError("expand dims must be non-negative")
+
+            if old_dim == new_dim:
+                # same size: keep the old stride
+                new_strides.append(old_stride)
+            elif old_dim == 1:
+                # expanded singleton dimension: stride 0
+                new_strides.append(0)
+            else:
+                raise ValueError(f"cannot expand shape {self.shape} to {shape}")
+
+        return Tensor(
+            self.storage,
+            shape=shape,
+            strides=tuple(new_strides),
+            offset=self.offset,
+            requires_grad=self.requires_grad,
+            _children=(self,),
+            _op="expand",
+        )
     
 def test_views():
     x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
@@ -428,6 +560,183 @@ def test_1d_broadcast_add():
         [14.0, 25.0, 36.0],
     ]
 
+def test_3d_broadcast_add():
+    a = Tensor.from_nested([
+        [[1, 2, 3]],
+        [[4, 5, 6]],
+    ])  # shape (2, 1, 3)
+
+    b = Tensor.from_nested([
+        [[10], [20], [30], [40]],
+    ])  # shape (1, 4, 1)
+
+    assert (a + b).tolist() == [
+        [[11.0, 12.0, 13.0], [21.0, 22.0, 23.0], [31.0, 32.0, 33.0], [41.0, 42.0, 43.0]],
+        [[14.0, 15.0, 16.0], [24.0, 25.0, 26.0], [34.0, 35.0, 36.0], [44.0, 45.0, 46.0]],
+    ]
+
+def test_broadcast_add_on_noncontiguous_view():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)            # shape (3, 2), non-contiguous
+    v = Tensor.from_nested([10, 20])  # shape (2,)
+
+    assert (xt + v).tolist() == [
+        [11.0, 24.0],
+        [12.0, 25.0],
+        [13.0, 26.0],
+    ]
+
+def test_mul_on_view():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)
+    assert (xt * 10).tolist() == [
+        [10.0, 40.0],
+        [20.0, 50.0],
+        [30.0, 60.0],
+    ]
+
+def test_row_broadcast_mul():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    row = Tensor.from_nested([[10, 20, 30]])
+    assert (x * row).tolist() == [
+        [10.0, 40.0, 90.0],
+        [40.0, 100.0, 180.0],
+    ]
+
+def test_col_broadcast_mul():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    col = Tensor.from_nested([[10], [20]])
+    assert (x * col).tolist() == [
+        [10.0, 20.0, 30.0],
+        [80.0, 100.0, 120.0],
+    ]
+
+def test_3d_broadcast_mul():
+    a = Tensor.from_nested([
+        [[1, 2, 3]],
+        [[4, 5, 6]],
+    ])  # (2, 1, 3)
+
+    b = Tensor.from_nested([
+        [[10], [20], [30], [40]],
+    ])  # (1, 4, 1)
+
+    assert (a * b).tolist() == [
+        [[10.0, 20.0, 30.0], [20.0, 40.0, 60.0], [30.0, 60.0, 90.0], [40.0, 80.0, 120.0]],
+        [[40.0, 50.0, 60.0], [80.0, 100.0, 120.0], [120.0, 150.0, 180.0], [160.0, 200.0, 240.0]],
+    ]
+
+def test_sum_all():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    assert x.sum().shape == ()
+    assert x.sum().tolist() == 21.0
+
+def test_sum_axis0():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    assert x.sum(axis=0).tolist() == [5.0, 7.0, 9.0]
+
+def test_sum_axis1_keepdims():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    assert x.sum(axis=1, keepdims=True).tolist() == [[6.0], [15.0]]
+
+def test_sum_on_view():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)
+    assert xt.sum(axis=0).tolist() == [6.0, 15.0]
+
+def test_sum_multi_axis():
+    x = Tensor.from_nested([
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+    ])
+    assert x.sum(axis=(0, 2)).tolist() == [14.0, 22.0]
+
+def test_matmul_basic():
+    a = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    b = Tensor.from_nested([[7, 8], [9, 10], [11, 12]])
+    assert (a @ b).tolist() == [[58.0, 64.0], [139.0, 154.0]]
+
+def test_matmul_with_view():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    xt = x.transpose(0, 1)   # shape (3, 2)
+    y = Tensor.from_nested([[10, 20, 30], [40, 50, 60]])  # shape (2, 3)
+
+    assert (xt @ y).tolist() == [
+        [170.0, 220.0, 270.0],
+        [220.0, 290.0, 360.0],
+        [270.0, 360.0, 450.0],
+    ]
+
+def test_matmul_shape_error():
+    a = Tensor.from_nested([[1, 2], [3, 4]])
+    b = Tensor.from_nested([[1, 2], [3, 4], [5, 6]])
+    try:
+        a @ b
+        assert False, "expected shape mismatch"
+    except ValueError:
+        pass
+
+def test_mean_axis0():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    assert x.mean(axis=0).tolist() == [2.5, 3.5, 4.5]
+
+def test_sum_keepdims_multi_axis():
+    x = Tensor.from_nested([
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+    ])
+    assert x.sum(axis=(0, 2), keepdims=True).tolist() == [[[14.0], [22.0]]]
+
+def test_expand_row():
+    row = Tensor.from_nested([[10, 20, 30]])
+    ex = row.expand(2, 3)
+    assert ex.shape == (2, 3)
+    assert ex.strides == (0, 1)
+    assert ex.tolist() == [
+        [10.0, 20.0, 30.0],
+        [10.0, 20.0, 30.0],
+    ]
+
+def test_expand_vector():
+    v = Tensor.from_nested([1, 2, 3])
+    ex = v.expand(2, 3)
+    assert ex.tolist() == [
+        [1.0, 2.0, 3.0],
+        [1.0, 2.0, 3.0],
+    ]
+
+def test_expand_aliasing():
+    row = Tensor.from_nested([[10, 20, 30]])
+    ex = row.expand(2, 3)
+    row.storage[1] = 99.0
+    assert ex.tolist() == [
+        [10.0, 99.0, 30.0],
+        [10.0, 99.0, 30.0],
+    ]
+
+def test_expand_column():
+    col = Tensor.from_nested([[10], [20]])
+    ex = col.expand(2, 3)
+    assert ex.shape == (2, 3)
+    assert ex.strides == (1, 0)
+    assert ex.tolist() == [
+        [10.0, 10.0, 10.0],
+        [20.0, 20.0, 20.0],
+    ]
+
+def test_expand_invalid():
+    x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
+    try:
+        x.expand(4, 3)
+        assert False, "expected invalid expand"
+    except ValueError:
+        pass
+
+def test_expand_view_addresses():
+    row = Tensor.from_nested([[10, 20, 30]])
+    ex = row.expand(2, 3)
+    assert ex.get(0, 1) == ex.get(1, 1) == 20.0
+
 test_views()
 test_aliasing()
 test_3d_views()
@@ -440,4 +749,26 @@ test_row_broadcast_add()
 test_col_broadcast_add()
 test_scalar_left_add()
 test_1d_broadcast_add()
+test_3d_broadcast_add()
+test_broadcast_add_on_noncontiguous_view()
+test_mul_on_view()
+test_row_broadcast_mul()
+test_col_broadcast_mul()
+test_3d_broadcast_mul()
+test_sum_all()
+test_sum_axis0()
+test_sum_axis1_keepdims()
+test_sum_on_view()
+test_sum_multi_axis()
+test_matmul_basic()
+test_matmul_with_view()
+test_matmul_shape_error()
+test_mean_axis0()
+test_sum_keepdims_multi_axis()
+test_expand_row()
+test_expand_vector()
+test_expand_aliasing()
+test_expand_column()
+test_expand_invalid()
+test_expand_view_addresses()
 print("All tests passed!")
