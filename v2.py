@@ -1,3 +1,5 @@
+import math
+
 class Tensor:
     __slots__ = ("storage", "shape", "strides", "offset",
         "requires_grad", "grad", "_prev", "_op", "_backward",)
@@ -374,31 +376,6 @@ class Tensor:
 
         return self.sum(axis=axes, keepdims=keepdims) * (1.0 / denom)
     
-    def __matmul__(self, other):
-        if not isinstance(other, Tensor):
-            raise TypeError("@ only supports Tensor @ Tensor")
-        if len(self.shape) != 2 or len(other.shape) != 2:
-            raise ValueError("matmul currently supports only 2D tensors")
-
-        M, K = self.shape
-        K2, N = other.shape
-        if K != K2:
-            raise ValueError(f"Shapes {self.shape} and {other.shape} not compatible for matmul")
-
-        out = Tensor.zeros(
-            (M, N),
-            requires_grad=self.requires_grad or other.requires_grad,
-        )
-
-        for i in range(M):
-            for j in range(N):
-                acc = 0.0
-                for k in range(K):
-                    acc += self.get(i, k) * other.get(k, j)
-                out.storage[out._storage_index((i, j))] = acc
-
-        return out
-    
     def expand(self, *shape):
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
@@ -436,6 +413,134 @@ class Tensor:
             _children=(self,),
             _op="expand",
         )
+    
+    def __matmul__(self, other):
+        if not isinstance(other, Tensor):
+            raise TypeError("@ only supports Tensor @ Tensor")
+        if len(self.shape) < 2 or len(other.shape) < 2:
+            raise ValueError("matmul currently supports only tensors with rank >= 2")
+
+        M, K = self.shape[-2:]
+        K2, N = other.shape[-2:]
+        if K != K2:
+            raise ValueError(f"Shapes {self.shape} and {other.shape} not compatible for matmul")
+
+        batch_shape = self._broadcast_shape(self.shape[:-2], other.shape[:-2])
+
+        a = self._expand_to(batch_shape + (M, K))
+        b = other._expand_to(batch_shape + (K, N))
+
+        out_shape = batch_shape + (M, N)
+        out = Tensor.zeros(
+            out_shape,
+            requires_grad=self.requires_grad or other.requires_grad,
+        )
+
+        for batch_idx in self._iter_indices(batch_shape):
+            for i in range(M):
+                for j in range(N):
+                    acc = 0.0
+                    for k in range(K):
+                        acc += a.get(*(batch_idx + (i, k))) * b.get(*(batch_idx + (k, j)))
+                    out.storage[out._storage_index(batch_idx + (i, j))] = acc
+
+        return out
+    
+    def softmax(self, axis=-1):
+        ndim = len(self.shape)
+        axis = self._canon_dim(axis, ndim)
+
+        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad)
+
+        outer_shape = self.shape[:axis] + self.shape[axis + 1:]
+        n = self.shape[axis]
+
+        for outer_idx in self._iter_indices(outer_shape):
+            def full_idx(j):
+                return outer_idx[:axis] + (j,) + outer_idx[axis:]
+
+            m = max(self.get(*full_idx(j)) for j in range(n))
+            exps = [math.exp(self.get(*full_idx(j)) - m) for j in range(n)]
+            s = sum(exps)
+
+            for j, e in enumerate(exps):
+                out.storage[out._storage_index(full_idx(j))] = e / s
+
+        return out
+    
+    def apply_causal_mask(self, mask_value=float("-inf")):
+        if len(self.shape) < 2:
+            raise ValueError("causal mask requires rank >= 2")
+
+        T1, T2 = self.shape[-2:]
+        if T1 != T2:
+            raise ValueError("last two dims must form a square matrix")
+
+        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad)
+
+        for prefix in self._iter_indices(self.shape[:-2]):
+            for i in range(T1):
+                for j in range(T2):
+                    idx = prefix + (i, j)
+                    out.storage[out._storage_index(idx)] = (
+                        self.get(*idx) if j <= i else mask_value
+                    )
+
+        return out
+    
+    def relu(self):
+        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad)
+        for idx in self._iter_indices(self.shape):
+            x = self.get(*idx)
+            out.storage[out._storage_index(idx)] = x if x > 0.0 else 0.0
+        return out
+    
+    def layernorm_last_dim(self, eps=1e-5):
+        if len(self.shape) == 0:
+            raise ValueError("layernorm requires rank >= 1")
+
+        N = self.shape[-1]
+        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad)
+
+        for outer_idx in self._iter_indices(self.shape[:-1]):
+            vals = [self.get(*(outer_idx + (j,))) for j in range(N)]
+            mean = sum(vals) / N
+            var = sum((x - mean) ** 2 for x in vals) / N
+            invstd = 1.0 / math.sqrt(var + eps)
+
+            for j, x in enumerate(vals):
+                out.storage[out._storage_index(outer_idx + (j,))] = (x - mean) * invstd
+
+        return out
+    
+def attention(q, k, v, mask=True):
+    Dh = q.shape[-1]
+    scores = (q @ k.transpose(-1, -2)) * (1.0 / math.sqrt(Dh))
+
+    if mask:
+        scores = scores.apply_causal_mask()
+
+    weights = scores.softmax(axis=-1)
+    return weights @ v
+
+def mha_forward(x, Wq, Wk, Wv, Wo, n_heads):
+    B, T, C = x.shape
+    assert C % n_heads == 0
+    Dh = C // n_heads
+
+    q = (x @ Wq).reshape(B, T, n_heads, Dh).permute(0, 2, 1, 3)
+    k = (x @ Wk).reshape(B, T, n_heads, Dh).permute(0, 2, 1, 3)
+    v = (x @ Wv).reshape(B, T, n_heads, Dh).permute(0, 2, 1, 3)
+
+    out = attention(q, k, v, mask=True)                  # (B, H, T, Dh)
+    out = out.permute(0, 2, 1, 3).contiguous()           # (B, T, H, Dh)
+    out = out.reshape(B, T, C)                           # (B, T, C)
+    return out @ Wo
+
+def transformer_block_forward(x, Wq, Wk, Wv, Wo, W1, W2, n_heads):
+    x = x + mha_forward(x.layernorm_last_dim(), Wq, Wk, Wv, Wo, n_heads)
+    x = x + ((x.layernorm_last_dim() @ W1).relu() @ W2)
+    return x
     
 def test_views():
     x = Tensor.from_nested([[1, 2, 3], [4, 5, 6]])
@@ -737,6 +842,205 @@ def test_expand_view_addresses():
     ex = row.expand(2, 3)
     assert ex.get(0, 1) == ex.get(1, 1) == 20.0
 
+def test_batched_matmul_basic():
+    a = Tensor.from_nested([
+        [[1, 2, 3], [4, 5, 6]],
+        [[7, 8, 9], [10, 11, 12]],
+    ])  # shape (2, 2, 3)
+
+    b = Tensor.from_nested([
+        [[1, 2], [3, 4], [5, 6]],
+        [[2, 0], [1, 2], [0, 1]],
+    ])  # shape (2, 3, 2)
+
+    assert (a @ b).tolist() == [
+        [[22.0, 28.0], [49.0, 64.0]],
+        [[22.0, 25.0], [31.0, 34.0]],
+    ]
+
+def test_batched_matmul_broadcast_rhs():
+    a = Tensor.from_nested([
+        [[1, 2, 3], [4, 5, 6]],
+        [[7, 8, 9], [10, 11, 12]],
+    ])  # shape (2, 2, 3)
+
+    b = Tensor.from_nested([
+        [1, 0],
+        [0, 1],
+        [1, 1],
+    ])  # shape (3, 2)
+
+    assert (a @ b).tolist() == [
+        [[4.0, 5.0], [10.0, 11.0]],
+        [[16.0, 17.0], [22.0, 23.0]],
+    ]
+
+def test_batched_matmul_with_view():
+    x = Tensor.from_nested([
+        [[1, 2, 3], [4, 5, 6]],
+        [[7, 8, 9], [10, 11, 12]],
+    ])  # shape (2, 2, 3)
+
+    xt = x.transpose(-1, -2)  # shape (2, 3, 2), non-contiguous
+    y = Tensor.from_nested([
+        [1, 2, 3],
+        [4, 5, 6],
+    ])  # shape (2, 3)
+
+    assert (xt @ y).tolist() == [
+        [[17.0, 22.0, 27.0], [22.0, 29.0, 36.0], [27.0, 36.0, 45.0]],
+        [[47.0, 64.0, 81.0], [52.0, 71.0, 90.0], [57.0, 78.0, 99.0]],
+    ]
+
+def test_batched_matmul_batch_shape_error():
+    a = Tensor.from_nested([
+        [[1, 2, 3], [4, 5, 6]],
+        [[7, 8, 9], [10, 11, 12]],
+    ])  # shape (2, 2, 3)
+
+    b = Tensor.from_nested([
+        [[1, 2], [3, 4], [5, 6]],
+        [[7, 8], [9, 10], [11, 12]],
+        [[13, 14], [15, 16], [17, 18]],
+    ])  # shape (3, 3, 2)
+
+    try:
+        a @ b
+        assert False, "expected batch shape mismatch"
+    except ValueError:
+        pass
+
+def test_softmax_last_dim():
+    x = Tensor.from_nested([[1, 2, 3], [1000, 1001, 1002]])
+    y = x.softmax(axis=-1)
+    rows = y.tolist()
+
+    for row in rows:
+        assert abs(sum(row) - 1.0) < 1e-9
+
+    assert rows[0][0] < rows[0][1] < rows[0][2]
+    assert rows[1][0] < rows[1][1] < rows[1][2]
+
+def test_softmax_on_view():
+    x = Tensor.from_nested([[1, 4], [2, 5], [3, 6]])
+    xt = x.transpose(0, 1)   # shape (2, 3), non-contiguous
+    y = xt.softmax(axis=-1)
+
+    rows = y.tolist()
+    for row in rows:
+        assert abs(sum(row) - 1.0) < 1e-9
+
+def test_causal_mask_2d():
+    x = Tensor.from_nested([
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+    ])
+    y = x.apply_causal_mask().tolist()
+
+    assert y == [
+        [1.0, float("-inf"), float("-inf")],
+        [4.0, 5.0, float("-inf")],
+        [7.0, 8.0, 9.0],
+    ]
+
+def test_causal_mask_batched():
+    x = Tensor.from_nested([
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+    ])  # shape (2, 2, 2)
+
+    y = x.apply_causal_mask().tolist()
+    assert y == [
+        [[1.0, float("-inf")], [3.0, 4.0]],
+        [[5.0, float("-inf")], [7.0, 8.0]],
+    ]
+
+def test_attention_causal_tiny():
+    q = Tensor.from_nested([[[[1.0], [1.0], [1.0]]]])   # shape (1, 1, 3, 1)
+    k = Tensor.from_nested([[[[1.0], [1.0], [1.0]]]])   # shape (1, 1, 3, 1)
+    v = Tensor.from_nested([[[[10.0], [20.0], [30.0]]]])# shape (1, 1, 3, 1)
+
+    out = attention(q, k, v, mask=True)
+    vals = out.tolist()
+
+    assert out.shape == (1, 1, 3, 1)
+    assert abs(vals[0][0][0][0] - 10.0) < 1e-9
+    assert abs(vals[0][0][1][0] - 15.0) < 1e-9
+    assert abs(vals[0][0][2][0] - 20.0) < 1e-9
+
+def test_attention_no_mask_tiny():
+    q = Tensor.from_nested([[[[1.0], [1.0], [1.0]]]])
+    k = Tensor.from_nested([[[[1.0], [1.0], [1.0]]]])
+    v = Tensor.from_nested([[[[10.0], [20.0], [30.0]]]])
+
+    out = attention(q, k, v, mask=False).tolist()
+
+    for t in range(3):
+        assert abs(out[0][0][t][0] - 20.0) < 1e-9
+
+def test_mha_shape():
+    x = Tensor.from_nested([[
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [9.0, 10.0, 11.0, 12.0],
+    ]])  # shape (1, 3, 4)
+
+    I = Tensor.from_nested([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+
+    out = mha_forward(x, I, I, I, I, n_heads=2)
+    assert out.shape == (1, 3, 4)
+
+def test_layernorm_last_dim():
+    x = Tensor.from_nested([
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+    ])
+    y = x.layernorm_last_dim().tolist()
+
+    for batch in y:
+        for row in batch:
+            mean = sum(row) / len(row)
+            var = sum((v - mean) ** 2 for v in row) / len(row)
+            assert abs(mean) < 1e-6
+            assert abs(var - 1.0) < 1e-4
+
+def test_layernorm_on_view():
+    x = Tensor.from_nested([[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]])
+    xt = x.transpose(0, 1)   # shape (2, 3), non-contiguous
+    y = xt.layernorm_last_dim().tolist()
+
+    for row in y:
+        mean = sum(row) / len(row)
+        var = sum((v - mean) ** 2 for v in row) / len(row)
+        assert abs(mean) < 1e-6
+        assert abs(var - 1.0) < 1e-4
+
+def test_relu():
+    x = Tensor.from_nested([[-1.0, 0.0, 2.0], [3.0, -4.0, 5.0]])
+    y = x.relu().tolist()
+    assert y == [[0.0, 0.0, 2.0], [3.0, 0.0, 5.0]]
+
+def test_transformer_block_shape():
+    x = Tensor.from_nested([[
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [9.0, 10.0, 11.0, 12.0],
+    ]])  # shape (1, 3, 4)
+
+    Z44 = Tensor.zeros((4, 4))
+    Z48 = Tensor.zeros((4, 8))
+    Z84 = Tensor.zeros((8, 4))
+
+    out = transformer_block_forward(x, Z44, Z44, Z44, Z44, Z48, Z84, n_heads=2)
+    assert out.shape == (1, 3, 4)
+    assert out.tolist() == x.tolist()
+
 test_views()
 test_aliasing()
 test_3d_views()
@@ -771,4 +1075,19 @@ test_expand_aliasing()
 test_expand_column()
 test_expand_invalid()
 test_expand_view_addresses()
+test_batched_matmul_basic()
+test_batched_matmul_broadcast_rhs()
+test_batched_matmul_with_view()
+test_batched_matmul_batch_shape_error()
+test_softmax_last_dim()
+test_softmax_on_view()
+test_causal_mask_2d()
+test_causal_mask_batched()
+test_attention_causal_tiny()
+test_attention_no_mask_tiny()
+test_mha_shape()
+test_layernorm_last_dim()
+test_layernorm_on_view()
+test_relu()
+test_transformer_block_shape()
 print("All tests passed!")
