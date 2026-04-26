@@ -1,9 +1,12 @@
 import math
+from contextlib import contextmanager
+from operator import __mul__
 
 class Tensor:
     __slots__ = ("storage", "shape", "strides", "offset",
         "requires_grad", "grad", "_prev", "_op", "_backward",)
-    
+    grad_enabled = True
+
     def __init__(self, storage, shape, strides=None, offset=0, requires_grad=False, _children=(), _op=""):
         self.storage = storage
         self.shape = tuple([int(d) for d in shape])
@@ -281,58 +284,56 @@ class Tensor:
 
         return tuple(reversed(out))
 
-    # @staticmethod
-    # def _broadcast_index(out_idx, in_shape):
-    #     pad = len(out_idx) - len(in_shape)
-    #     idx = []
-
-    #     for i, dim in enumerate(in_shape):
-    #         oi = out_idx[pad + i]
-    #         idx.append(0 if dim == 1 else oi)
-
-    #     return tuple(idx)
+    @staticmethod
+    def _project_index_to_shape(out_idx, in_shape):
+        pad = len(out_idx) - len(in_shape)
+        idx = []
+        for i, dim in enumerate(in_shape):
+            oi = out_idx[pad + i]
+            idx.append(0 if dim == 1 else oi)
+        return tuple(idx)
     
     def _expand_to(self, shape):
         shape = tuple(shape)
         return self if self.shape == shape else self.expand(shape)
 
-    def __add__(self, other):
-        other = self._coerce(other)
-        out_shape = self._broadcast_shape(self.shape, other.shape)
+    # def __add__(self, other):
+    #     other = self._coerce(other)
+    #     out_shape = self._broadcast_shape(self.shape, other.shape)
 
-        a = self._expand_to(out_shape)
-        b = other._expand_to(out_shape)
+    #     a = self._expand_to(out_shape)
+    #     b = other._expand_to(out_shape)
 
-        out = Tensor.zeros(
-            out_shape,
-            requires_grad=self.requires_grad or other.requires_grad,
-        )
+    #     out = Tensor.zeros(
+    #         out_shape,
+    #         requires_grad=self.requires_grad or other.requires_grad,
+    #     )
 
-        for idx in self._iter_indices(out_shape):
-            out.storage[out._storage_index(idx)] = a.get(*idx) + b.get(*idx)
+    #     for idx in self._iter_indices(out_shape):
+    #         out.storage[out._storage_index(idx)] = a.get(*idx) + b.get(*idx)
 
-        return out
+    #     return out
 
-    __radd__ = __add__
+    # __radd__ = __add__
 
-    def __mul__(self, other):
-        other = self._coerce(other)
-        out_shape = self._broadcast_shape(self.shape, other.shape)
+    # def __mul__(self, other):
+    #     other = self._coerce(other)
+    #     out_shape = self._broadcast_shape(self.shape, other.shape)
 
-        a = self._expand_to(out_shape)
-        b = other._expand_to(out_shape)
+    #     a = self._expand_to(out_shape)
+    #     b = other._expand_to(out_shape)
 
-        out = Tensor.zeros(
-            out_shape,
-            requires_grad=self.requires_grad or other.requires_grad,
-        )
+    #     out = Tensor.zeros(
+    #         out_shape,
+    #         requires_grad=self.requires_grad or other.requires_grad,
+    #     )
 
-        for idx in self._iter_indices(out_shape):
-            out.storage[out._storage_index(idx)] = a.get(*idx) * b.get(*idx)
+    #     for idx in self._iter_indices(out_shape):
+    #         out.storage[out._storage_index(idx)] = a.get(*idx) * b.get(*idx)
 
-        return out
+    #     return out
 
-    __rmul__ = __mul__
+    # __rmul__ = __mul__
 
     @staticmethod
     def _canon_axes(axis, ndim):
@@ -512,6 +513,209 @@ class Tensor:
                 out.storage[out._storage_index(outer_idx + (j,))] = (x - mean) * invstd
 
         return out
+    
+    @classmethod
+    @contextmanager
+    def no_grad(cls):
+        prev = cls.grad_enabled
+        cls.grad_enabled = False
+        try:
+            yield
+        finally:
+            cls.grad_enabled = prev
+
+    @classmethod
+    def _should_track(cls, parents):
+        return cls.grad_enabled and any(p.requires_grad for p in parents)
+    
+    @classmethod
+    def _make_out(cls, storage, shape, parents, op, strides=None, offset=0):
+        track = cls._should_track(parents)
+        out = cls(
+            storage,
+            shape=shape,
+            strides=strides,
+            offset=offset,
+            requires_grad=track,
+            _children=parents if track else (),
+            _op=op,
+        )
+        return out, track
+    
+    def _ensure_grad(self):
+        if self.grad is None:
+            self.grad = Tensor.zeros(self.shape, requires_grad=False)
+        return self.grad
+    
+    def zero_grad(self):
+        if self.grad is not None:
+            self.grad = Tensor.zeros(self.shape, requires_grad=False)
+
+    def backward(self):
+        if self.shape != ():
+            raise ValueError("backward() currently only supports scalar outputs")
+        if not self.requires_grad:
+            raise ValueError("cannot call backward() on tensor that does not require grad")
+
+        topo = []
+        visited = set()
+
+        def build(v):
+            if v not in visited:
+                visited.add(v)
+                for p in v._prev:
+                    build(p)
+                topo.append(v)
+
+        build(self)
+
+        self.grad = Tensor([1.0], shape=(), requires_grad=False)
+
+        for v in reversed(topo):
+            v._backward()
+
+    def expand(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+            shape = tuple(shape[0])
+        else:
+            shape = tuple(shape)
+
+        if len(shape) < len(self.shape):
+            raise ValueError("cannot expand to fewer dimensions")
+
+        pad = len(shape) - len(self.shape)
+        old_shape = (1,) * pad + self.shape
+        old_strides = (0,) * pad + self.strides
+
+        new_strides = []
+        for old_dim, old_stride, new_dim in zip(old_shape, old_strides, shape):
+            if new_dim < 0:
+                raise ValueError("expand dims must be non-negative")
+            if old_dim == new_dim:
+                new_strides.append(old_stride)
+            elif old_dim == 1:
+                new_strides.append(0)
+            else:
+                raise ValueError(f"cannot expand shape {self.shape} to {shape}")
+
+        out, track = Tensor._make_out(
+            self.storage,
+            shape=shape,
+            parents=(self,),
+            op="expand",
+            strides=tuple(new_strides),
+            offset=self.offset,
+        )
+        if not track:
+            return out
+
+        def _backward():
+            sg = self._ensure_grad()
+            og = out.grad
+            for out_idx in self._iter_indices(out.shape):
+                src_idx = self._project_index_to_shape(out_idx, self.shape)
+                sg.storage[sg._storage_index(src_idx)] += og.get(*out_idx)
+
+        out._backward = _backward
+        return out
+    
+    def sum(self, axis=None, keepdims=False):
+        ndim = len(self.shape)
+        axes = self._canon_axes(axis, ndim)
+
+        if keepdims:
+            out_shape = tuple(1 if i in axes else self.shape[i] for i in range(ndim))
+        else:
+            out_shape = tuple(self.shape[i] for i in range(ndim) if i not in axes)
+
+        out_storage = [0.0] * Tensor._prod(out_shape)
+        out, track = Tensor._make_out(out_storage, out_shape, (self,), "sum")
+        
+        for idx in self._iter_indices(self.shape):
+            if keepdims:
+                out_idx = tuple(0 if i in axes else idx[i] for i in range(ndim))
+            else:
+                out_idx = tuple(idx[i] for i in range(ndim) if i not in axes)
+            out.storage[out._storage_index(out_idx)] += self.get(*idx)
+
+        if not track:
+            return out
+
+        def _backward():
+            sg = self._ensure_grad()
+            og = out.grad
+            for idx in self._iter_indices(self.shape):
+                if keepdims:
+                    out_idx = tuple(0 if i in axes else idx[i] for i in range(ndim))
+                else:
+                    out_idx = tuple(idx[i] for i in range(ndim) if i not in axes)
+                sg.storage[sg._storage_index(idx)] += og.get(*out_idx)
+
+        out._backward = _backward
+        return out
+    
+    def __add__(self, other):
+        other = self._coerce(other)
+        out_shape = self._broadcast_shape(self.shape, other.shape)
+
+        a = self._expand_to(out_shape)
+        b = other._expand_to(out_shape)
+
+        out_storage = [0.0] * Tensor._prod(out_shape)
+        out, track = Tensor._make_out(out_storage, out_shape, (a, b), "add")
+
+        for idx in self._iter_indices(out_shape):
+            out.storage[out._storage_index(idx)] = a.get(*idx) + b.get(*idx)
+
+        if not track:
+            return out
+
+        def _backward():
+            og = out.grad
+            if a.requires_grad:
+                ag = a._ensure_grad()
+                for idx in self._iter_indices(out_shape):
+                    ag.storage[ag._storage_index(idx)] += og.get(*idx)
+            if b.requires_grad:
+                bg = b._ensure_grad()
+                for idx in self._iter_indices(out_shape):
+                    bg.storage[bg._storage_index(idx)] += og.get(*idx)
+
+        out._backward = _backward
+        return out
+    
+    def __mul__(self, other):
+        other = self._coerce(other)
+        out_shape = self._broadcast_shape(self.shape, other.shape)
+
+        a = self._expand_to(out_shape)
+        b = other._expand_to(out_shape)
+
+        out_storage = [0.0] * Tensor._prod(out_shape)
+        out, track = Tensor._make_out(out_storage, out_shape, (a, b), "mul")
+
+        for idx in self._iter_indices(out_shape):
+            out.storage[out._storage_index(idx)] = a.get(*idx) * b.get(*idx)
+
+        if not track:
+            return out
+
+        def _backward():
+            og = out.grad
+            if a.requires_grad:
+                ag = a._ensure_grad()
+                for idx in self._iter_indices(out_shape):
+                    ag.storage[ag._storage_index(idx)] += b.get(*idx) * og.get(*idx)
+            if b.requires_grad:
+                bg = b._ensure_grad()
+                for idx in self._iter_indices(out_shape):
+                    bg.storage[bg._storage_index(idx)] += a.get(*idx) * og.get(*idx)
+
+        out._backward = _backward
+        return out
+    
+    __radd__ = __add__
+    __rmul__ = __mul__
     
 def attention(q, k, v, mask=True):
     Dh = q.shape[-1]
@@ -1041,6 +1245,43 @@ def test_transformer_block_shape():
     assert out.shape == (1, 3, 4)
     assert out.tolist() == x.tolist()
 
+def test_expand_backward():
+    x = Tensor.from_nested([[1.0, 2.0, 3.0]], requires_grad=True)
+    y = x.expand(2, 3).sum()
+    y.backward()
+    assert x.grad.tolist() == [[2.0, 2.0, 2.0]]
+
+def test_add_backward():
+    x = Tensor.from_nested([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    y = (x + x).sum()
+    y.backward()
+    assert x.grad.tolist() == [[2.0, 2.0], [2.0, 2.0]]
+
+def test_mul_backward_scalar():
+    x = Tensor.from_nested([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    y = (x * 3.0).sum()
+    y.backward()
+    assert x.grad.tolist() == [[3.0, 3.0], [3.0, 3.0]]
+
+def test_radd_backward():
+    x = Tensor.from_nested([[1.0, 2.0]], requires_grad=True)
+    y = (2.0 + x).sum()
+    y.backward()
+    assert x.grad.tolist() == [[1.0, 1.0]]
+
+def test_rmul_backward():
+    x = Tensor.from_nested([[1.0, 2.0]], requires_grad=True)
+    y = (3.0 * x).sum()
+    y.backward()
+    assert x.grad.tolist() == [[3.0, 3.0]]
+
+def test_no_grad_expand():
+    x = Tensor.from_nested([[1.0, 2.0]], requires_grad=True)
+    with Tensor.no_grad():
+        y = x.expand(2, 2)
+    assert y.requires_grad is False
+    assert y._prev == ()
+
 test_views()
 test_aliasing()
 test_3d_views()
@@ -1090,4 +1331,10 @@ test_layernorm_last_dim()
 test_layernorm_on_view()
 test_relu()
 test_transformer_block_shape()
+test_expand_backward()
+test_add_backward()
+test_mul_backward_scalar()
+test_radd_backward()
+test_rmul_backward()
+test_no_grad_expand()
 print("All tests passed!")
